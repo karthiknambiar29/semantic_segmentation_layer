@@ -50,6 +50,30 @@ using nav2_costmap_2d::NO_INFORMATION;
 
 namespace semantic_segmentation_layer {
 
+namespace
+{
+/**
+ * @brief Whether a cloud can be indexed row major by a mask of this size.
+ *
+ * SegmentationBuffer::bufferSegmentation walks the cloud iterators once per mask pixel and maps
+ * pixel (v,u) to pixel_idx = v * segmentation.width + u, so the two only have to share a row
+ * stride. The cloud may be TALLER: the librealsense decimation filter pads the decimated height
+ * up to a multiple of the patch size, so a 640x360 depth decimated by 4 comes out 160x92 while
+ * the mask is 160x90. Those trailing cloud rows are simply never consumed.
+ *
+ * The old test compared only the total point counts. It rejected that perfectly usable pair on
+ * every frame, which starved this layer, and it would also have accepted a transposed cloud.
+ */
+bool maskCanIndexCloud(
+  const sensor_msgs::msg::Image & segmentation, const sensor_msgs::msg::PointCloud2 & pointcloud)
+{
+  return segmentation.width == pointcloud.width && pointcloud.height >= segmentation.height &&
+         static_cast<size_t>(pointcloud.width) * pointcloud.height >=
+           static_cast<size_t>(segmentation.width) * segmentation.height;
+}
+}  // namespace
+
+
 SemanticSegmentationLayer::SemanticSegmentationLayer() {}
 
 // This method is called at the end of plugin initialization.
@@ -461,10 +485,11 @@ void SemanticSegmentationLayer::syncSegmPointcloudCb(
   const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
   const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer> & buffer)
 {
-  if (segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
+  if (!maskCanIndexCloud(*segmentation, *pointcloud))
   {
     RCLCPP_WARN(logger_,
-                "Pointcloud and segmentation sizes are different, will not buffer message. "
+                "Pointcloud is not usable for this segmentation, will not buffer message. The width "
+                "must match and the cloud must be at least as tall. "
                 "segmentation->width:%u,  "
                 "segmentation->height:%u, pointcloud->width:%u, pointcloud->height:%u",
                 segmentation->width, segmentation->height, pointcloud->width, pointcloud->height);
@@ -499,10 +524,11 @@ void SemanticSegmentationLayer::syncSegmConfPointcloudCb(const std::shared_ptr<c
                               const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
                               const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer)
 {
-  if (segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
+  if (!maskCanIndexCloud(*segmentation, *pointcloud))
     {
       RCLCPP_WARN(logger_,
-                  "Pointcloud and segmentation sizes are different, will not buffer message. "
+                  "Pointcloud is not usable for this segmentation, will not buffer message. The "
+                  "width must match and the cloud must be at least as tall. "
                   "segmentation->width:%u,  "
                   "segmentation->height:%u, pointcloud->width:%u, pointcloud->height:%u",
                   segmentation->width, segmentation->height, pointcloud->width, pointcloud->height);
