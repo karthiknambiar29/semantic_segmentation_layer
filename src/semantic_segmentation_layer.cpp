@@ -487,7 +487,7 @@ void SemanticSegmentationLayer::syncSegmPointcloudCb(
 {
   if (!maskCanIndexCloud(*segmentation, *pointcloud))
   {
-    RCLCPP_WARN(logger_,
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000,
                 "Pointcloud is not usable for this segmentation, will not buffer message. The width "
                 "must match and the cloud must be at least as tall. "
                 "segmentation->width:%u,  "
@@ -526,7 +526,7 @@ void SemanticSegmentationLayer::syncSegmConfPointcloudCb(const std::shared_ptr<c
 {
   if (!maskCanIndexCloud(*segmentation, *pointcloud))
     {
-      RCLCPP_WARN(logger_,
+      RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000,
                   "Pointcloud is not usable for this segmentation, will not buffer message. The "
                   "width must match and the cloud must be at least as tall. "
                   "segmentation->width:%u,  "
