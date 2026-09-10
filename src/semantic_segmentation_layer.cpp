@@ -111,11 +111,43 @@ void SemanticSegmentationLayer::onInitialize()
     declareParameter(source + "." + "tile_map_decay_time", rclcpp::ParameterValue(5.0));
     declareParameter(source + "." + "visualize_tile_map", rclcpp::ParameterValue(false));
     declareParameter(source + "." + "use_cost_selection", rclcpp::ParameterValue(true));
-    
+    // LiDAR-projection mode: project an unorganized cloud into the segmentation
+    // image with the segmentation camera intrinsics instead of consuming a
+    // pixel-aligned RGBD cloud.
+    declareParameter(source + "." + "project_pointcloud", rclcpp::ParameterValue(false));
+    declareParameter(source + "." + "camera_info_topic", rclcpp::ParameterValue(""));
+    declareParameter(source + "." + "camera_optical_frame", rclcpp::ParameterValue(""));
+    declareParameter(source + "." + "approximate_sync", rclcpp::ParameterValue(false));
+    declareParameter(source + "." + "approximate_sync_tolerance", rclcpp::ParameterValue(0.05));
+    // Direct-cost mode: map the raw mask value straight to a costmap cost, with
+    // no class binning. Ignores class_types / class_ids / value ranges.
+    declareParameter(source + "." + "direct_cost", rclcpp::ParameterValue(false));
+    declareParameter(source + "." + "direct_cost_scale", rclcpp::ParameterValue(254.0));
+    declareParameter(source + "." + "direct_cost_offset", rclcpp::ParameterValue(0.0));
+    declareParameter(source + "." + "direct_cost_ignore_min", rclcpp::ParameterValue(-1));
+    declareParameter(source + "." + "direct_cost_ignore_max", rclcpp::ParameterValue(-1));
+
     node->get_parameter(name_ + "." + source + "." + "segmentation_topic", segmentation_topic);
     node->get_parameter(name_ + "." + source + "." + "confidence_topic", confidence_topic);
     node->get_parameter(name_ + "." + source + "." + "labels_topic", labels_topic);
     node->get_parameter(name_ + "." + source + "." + "pointcloud_topic", pointcloud_topic);
+    std::string camera_info_topic, camera_optical_frame;
+    bool project_pointcloud = false;
+    bool approximate_sync = false;
+    double approximate_sync_tolerance = 0.05;
+    node->get_parameter(name_ + "." + source + "." + "project_pointcloud", project_pointcloud);
+    node->get_parameter(name_ + "." + source + "." + "camera_info_topic", camera_info_topic);
+    node->get_parameter(name_ + "." + source + "." + "camera_optical_frame", camera_optical_frame);
+    node->get_parameter(name_ + "." + source + "." + "approximate_sync", approximate_sync);
+    node->get_parameter(name_ + "." + source + "." + "approximate_sync_tolerance", approximate_sync_tolerance);
+    // A separate LiDAR and camera never share exact stamps: force approximate sync.
+    if (project_pointcloud) {
+      approximate_sync = true;
+      if (camera_info_topic.empty()) {
+        RCLCPP_ERROR(logger_, "source %s has project_pointcloud=true but no camera_info_topic set", source.c_str());
+        exit(-1);
+      }
+    }
     node->get_parameter(name_ + "." + source + "." + "observation_persistence", observation_keep_time);
     node->get_parameter(name_ + "." + source + "." + "expected_update_rate", expected_update_rate);
     node->get_parameter(name_ + "." + source + "." + "class_types", class_types_string);
@@ -125,20 +157,45 @@ void SemanticSegmentationLayer::onInitialize()
     node->get_parameter(name_ + "." + source + "." + "visualize_tile_map", visualize_tile_map);
     bool use_cost_selection = true;
     node->get_parameter(name_ + "." + source + "." + "use_cost_selection", use_cost_selection);
+
+    bool direct_cost = false;
+    double direct_cost_scale = 254.0, direct_cost_offset = 0.0;
+    int direct_cost_ignore_min = -1, direct_cost_ignore_max = -1;
+    node->get_parameter(name_ + "." + source + "." + "direct_cost", direct_cost);
+    node->get_parameter(name_ + "." + source + "." + "direct_cost_scale", direct_cost_scale);
+    node->get_parameter(name_ + "." + source + "." + "direct_cost_offset", direct_cost_offset);
+    node->get_parameter(name_ + "." + source + "." + "direct_cost_ignore_min", direct_cost_ignore_min);
+    node->get_parameter(name_ + "." + source + "." + "direct_cost_ignore_max", direct_cost_ignore_max);
+    if (direct_cost)
+    {
+      // No class binning in this mode; class_types is not needed. Force a
+      // placeholder and the per-frame "keep the worst cost per tile" policy.
+      use_cost_selection = true;
+      class_types_string = {"direct_cost"};
+    }
+
     if (class_types_string.empty())
     {
       RCLCPP_ERROR(logger_, "no class types defined for source %s. Segmentation plugin cannot work this way", source.c_str());
       exit(-1);
     }
-    
+
     std::unordered_map<std::string, CostHeuristicParams> class_map;
 
     // Build class_type to class_names mapping for the buffer
     std::unordered_map<std::string, std::vector<std::string>> class_type_to_names;
+    // Fallback class-name -> class-id map, used when no labels_topic is set.
+    std::unordered_map<std::string, uint8_t> class_name_to_id;
+    // Score-threshold ranges (mask value -> class id), for continuous masks.
+    std::vector<SegmentationValueRange> value_ranges;
     for (auto& class_type : class_types_string)
     {
+      if (direct_cost) break;  // direct-cost mode ignores class_types entirely
       std::vector<std::string> classes_ids;
       declareParameter(source + "." + class_type + ".classes", rclcpp::ParameterValue(std::vector<std::string>({})));
+      declareParameter(source + "." + class_type + ".class_ids", rclcpp::ParameterValue(std::vector<int64_t>({})));
+      declareParameter(source + "." + class_type + ".value_min", rclcpp::ParameterValue(-1));
+      declareParameter(source + "." + class_type + ".value_max", rclcpp::ParameterValue(-1));
       declareParameter(source + "." + class_type + ".base_cost", rclcpp::ParameterValue(0));
       declareParameter(source + "." + class_type + ".max_cost", rclcpp::ParameterValue(0));
       declareParameter(source + "." + class_type + ".mark_confidence", rclcpp::ParameterValue(0));
@@ -154,7 +211,35 @@ void SemanticSegmentationLayer::onInitialize()
       
       // Store the mapping for the buffer
       class_type_to_names[class_type] = classes_ids;
-      
+
+      std::vector<int64_t> class_ids_param;
+      node->get_parameter(name_ + "." + source + "." + class_type + ".class_ids", class_ids_param);
+      for (size_t k = 0; k < classes_ids.size() && k < class_ids_param.size(); ++k)
+      {
+        class_name_to_id[classes_ids[k]] = static_cast<uint8_t>(class_ids_param[k]);
+      }
+
+      // Optional score threshold: mask values in [value_min, value_max] -> this
+      // class type's (first) class id. For continuous / traversability masks.
+      int value_min = -1, value_max = -1;
+      node->get_parameter(name_ + "." + source + "." + class_type + ".value_min", value_min);
+      node->get_parameter(name_ + "." + source + "." + class_type + ".value_max", value_max);
+      if (value_min >= 0 || value_max >= 0)
+      {
+        if (class_ids_param.empty() || value_min < 0 || value_max < 0 || value_min > value_max ||
+            value_max > 255)
+        {
+          RCLCPP_ERROR(logger_,
+                       "source %s type %s: value_min/value_max must be a valid 0-255 range and "
+                       "class_ids must be set to use score thresholding",
+                       source.c_str(), class_type.c_str());
+          exit(-1);
+        }
+        value_ranges.push_back(SegmentationValueRange{
+          static_cast<uint8_t>(value_min), static_cast<uint8_t>(value_max),
+          static_cast<uint8_t>(class_ids_param[0])});
+      }
+
       CostHeuristicParams cost_params;
       node->get_parameter(name_ + "." + source + "." + class_type + ".base_cost", cost_params.base_cost);
       node->get_parameter(name_ + "." + source + "." + class_type + ".max_cost", cost_params.max_cost);
@@ -168,7 +253,7 @@ void SemanticSegmentationLayer::onInitialize()
       }
     }
 
-    if (class_map.empty())
+    if (class_map.empty() && !direct_cost)
     {
       RCLCPP_ERROR(logger_, "No classes defined for source %s. Segmentation plugin cannot work this way", source.c_str());
       exit(-1);
@@ -193,21 +278,69 @@ void SemanticSegmentationLayer::onInitialize()
       node, source, class_types_string, class_map, class_type_to_names, observation_keep_time, expected_update_rate, max_obstacle_distance,
       min_obstacle_distance, *tf_, global_frame_, "",
       tf2::durationFromSec(transform_tolerance), getResolution(), tile_map_decay_time, visualize_tile_map,
-      use_cost_selection);
+      use_cost_selection, project_pointcloud, camera_optical_frame);
 
     segmentation_buffers_.push_back(segmentation_buffer);
-    
+
+    // Class-id source. Direct-cost mode builds its own value->cost table and
+    // ignores LabelInfo / class_ids / value ranges entirely.
+    if (direct_cost)
+    {
+      segmentation_buffer->setDirectCostMapping(direct_cost_scale, direct_cost_offset,
+                                                direct_cost_ignore_min, direct_cost_ignore_max);
+    }
+    else if (labels_topic.empty())
+    {
+      size_t n_class_names = 0;
+      for (const auto & kv : class_type_to_names) n_class_names += kv.second.size();
+      if (class_name_to_id.size() != n_class_names)
+      {
+        RCLCPP_ERROR(logger_,
+                     "source %s has no labels_topic and an incomplete `class_ids` parameter "
+                     "(%zu ids for %zu class names). Set one per class name.",
+                     source.c_str(), class_name_to_id.size(), n_class_names);
+        exit(-1);
+      }
+      segmentation_buffer->createSegmentationCostMultimapFromIds(class_name_to_id);
+    }
+    else if (!value_ranges.empty())
+    {
+      RCLCPP_WARN(logger_,
+                  "source %s: score thresholding (value_min/value_max) maps to the `class_ids` "
+                  "values, not LabelInfo ids. Make sure they match.",
+                  source.c_str());
+    }
+    segmentation_buffer->setValueRanges(value_ranges);
+
     auto semantic_segmentation_sub =
       std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image, rclcpp_lifecycle::LifecycleNode>>(
         node, segmentation_topic, custom_qos_profile, sub_opt);
     semantic_segmentation_sub->unsubscribe();
     semantic_segmentation_subs_.push_back(semantic_segmentation_sub);
 
-    auto label_info_sub = std::make_shared<message_filters::Subscriber<vision_msgs::msg::LabelInfo, rclcpp_lifecycle::LifecycleNode>>(
-        node, labels_topic, tl_qos_profile, tl_sub_opt);
-    label_info_sub->registerCallback(std::bind(&SemanticSegmentationLayer::labelinfoCb, this, std::placeholders::_1, segmentation_buffers_.back()));
-    label_info_sub->unsubscribe();
-    label_info_subs_.push_back(label_info_sub);
+    if (!labels_topic.empty())
+    {
+      auto label_info_sub = std::make_shared<message_filters::Subscriber<vision_msgs::msg::LabelInfo, rclcpp_lifecycle::LifecycleNode>>(
+          node, labels_topic, tl_qos_profile, tl_sub_opt);
+      label_info_sub->registerCallback(std::bind(&SemanticSegmentationLayer::labelinfoCb, this, std::placeholders::_1, segmentation_buffers_.back()));
+      label_info_sub->unsubscribe();
+      label_info_subs_.push_back(label_info_sub);
+    }
+
+    // CameraInfo for the segmentation camera (LiDAR-projection mode only). Plain
+    // subscription with the latest value cached: intrinsics are effectively
+    // static, so precise time-sync isn't needed for them.
+    if (project_pointcloud)
+    {
+      auto buffer_ptr = segmentation_buffers_.back();
+      auto ci_sub = node->create_subscription<sensor_msgs::msg::CameraInfo>(
+        camera_info_topic, rclcpp::QoS(5),
+        [buffer_ptr](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) { buffer_ptr->setCameraInfo(*msg); },
+        sub_opt);
+      camera_info_subs_.push_back(ci_sub);
+      RCLCPP_INFO(logger_, "source %s: LiDAR-projection mode, CameraInfo topic = %s",
+                  source.c_str(), camera_info_topic.c_str());
+    }
 
     auto pointcloud_sub = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2, rclcpp_lifecycle::LifecycleNode>>(
       node, pointcloud_topic, custom_qos_profile, sub_opt);
@@ -221,6 +354,7 @@ void SemanticSegmentationLayer::onInitialize()
       tf2::durationFromSec(transform_tolerance));
     pointcloud_tf_subs_.push_back(pointcloud_tf_sub);
 
+    const int sync_queue = 50;
     if(!confidence_topic.empty())
     {
       auto semantic_segmentation_confidence_sub =
@@ -228,25 +362,51 @@ void SemanticSegmentationLayer::onInitialize()
         node, confidence_topic, custom_qos_profile, sub_opt);
       semantic_segmentation_confidence_sub->unsubscribe();
       semantic_segmentation_confidence_subs_.push_back(semantic_segmentation_confidence_sub);
-      auto segm_conf_pc_sync =
-        std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Image, sensor_msgs::msg::Image,
-                                                          sensor_msgs::msg::PointCloud2>>(1000);
-      segm_conf_pc_sync->connectInput(*semantic_segmentation_subs_.back(), *semantic_segmentation_confidence_subs_.back(), *pointcloud_tf_subs_.back());
-      segm_conf_pc_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
-                                                std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, segmentation_buffers_.back()));
-      segm_conf_pc_notifiers_.push_back(segm_conf_pc_sync);
-       RCLCPP_INFO(logger_, "Confidence is enabled for source %s", source.c_str());
+      auto cb = std::bind(&SemanticSegmentationLayer::syncSegmConfPointcloudCb, this,
+                          std::placeholders::_1, std::placeholders::_2, std::placeholders::_3,
+                          segmentation_buffers_.back());
+      if (approximate_sync)
+      {
+        auto sync = std::make_shared<message_filters::Synchronizer<ApproxSegmConfPcPolicy>>(
+          ApproxSegmConfPcPolicy(sync_queue), *semantic_segmentation_subs_.back(),
+          *semantic_segmentation_confidence_subs_.back(), *pointcloud_tf_subs_.back());
+        sync->setMaxIntervalDuration(rclcpp::Duration::from_seconds(approximate_sync_tolerance));
+        sync->registerCallback(cb);
+        segm_conf_pc_approx_notifiers_.push_back(sync);
+      }
+      else
+      {
+        auto sync = std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Image,
+                                                                       sensor_msgs::msg::Image,
+                                                                       sensor_msgs::msg::PointCloud2>>(1000);
+        sync->connectInput(*semantic_segmentation_subs_.back(),
+                           *semantic_segmentation_confidence_subs_.back(), *pointcloud_tf_subs_.back());
+        sync->registerCallback(cb);
+        segm_conf_pc_notifiers_.push_back(sync);
+      }
+      RCLCPP_INFO(logger_, "Confidence is enabled for source %s", source.c_str());
     }
     else
     {
       RCLCPP_WARN(logger_, "Confidence topic was empty for source %s, not using segmentation confidence in that source", source.c_str());
-      auto segm_pc_sync =
-        std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Image,
-                                                          sensor_msgs::msg::PointCloud2>>(1000);
-      segm_pc_sync->connectInput(*semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
-      segm_pc_sync->registerCallback(std::bind(&SemanticSegmentationLayer::syncSegmPointcloudCb, this,
-                                                std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back()));
-      segm_pc_notifiers_.push_back(segm_pc_sync);
+      auto cb = std::bind(&SemanticSegmentationLayer::syncSegmPointcloudCb, this,
+                          std::placeholders::_1, std::placeholders::_2, segmentation_buffers_.back());
+      if (approximate_sync)
+      {
+        auto sync = std::make_shared<message_filters::Synchronizer<ApproxSegmPcPolicy>>(
+          ApproxSegmPcPolicy(sync_queue), *semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
+        sync->setMaxIntervalDuration(rclcpp::Duration::from_seconds(approximate_sync_tolerance));
+        sync->registerCallback(cb);
+        segm_pc_approx_notifiers_.push_back(sync);
+      }
+      else
+      {
+        auto sync = std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Image,
+                                                                       sensor_msgs::msg::PointCloud2>>(1000);
+        sync->connectInput(*semantic_segmentation_subs_.back(), *pointcloud_tf_subs_.back());
+        sync->registerCallback(cb);
+        segm_pc_notifiers_.push_back(sync);
+      }
     }
   }
 
@@ -391,7 +551,10 @@ void SemanticSegmentationLayer::syncSegmPointcloudCb(
   const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
   const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer> & buffer)
 {
-  if (segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
+  // In LiDAR-projection mode the cloud is unorganized and unrelated in size to
+  // the image, so the pixel-alignment check does not apply.
+  if (!buffer->isProjectionMode() &&
+      segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
   {
     RCLCPP_WARN(logger_,
                 "Pointcloud and segmentation sizes are different, will not buffer message. "
@@ -429,7 +592,8 @@ void SemanticSegmentationLayer::syncSegmConfPointcloudCb(const std::shared_ptr<c
                               const std::shared_ptr<const sensor_msgs::msg::PointCloud2>& pointcloud,
                               const std::shared_ptr<semantic_segmentation_layer::SegmentationBuffer>& buffer)
 {
-  if (segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
+  if (!buffer->isProjectionMode() &&
+      segmentation->width * segmentation->height != pointcloud->width * pointcloud->height)
     {
       RCLCPP_WARN(logger_,
                   "Pointcloud and segmentation sizes are different, will not buffer message. "

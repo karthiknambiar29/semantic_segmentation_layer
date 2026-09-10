@@ -39,12 +39,18 @@
 #ifndef SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_
 #define SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_
 
+#include <deque>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "nav2_util/lifecycle_node.hpp"
 #include "rclcpp/time.hpp"
+#include "semantic_segmentation_layer/camera_projection.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -60,6 +66,17 @@ struct CostHeuristicParams
     uint8_t base_cost, max_cost, mark_confidence;
     int samples_to_max_cost;
     bool dominant_priority;
+};
+
+/**
+ * @brief Maps a range of raw mono8 mask values to a class id, for masks that
+ * carry a continuous score (e.g. a traversability score 0..255) instead of
+ * discrete class ids. A pixel value v in [lo, hi] resolves to class_id.
+ */
+struct SegmentationValueRange
+{
+    uint8_t lo, hi;
+    uint8_t class_id;
 };
 
 /**
@@ -121,9 +138,19 @@ class TemporalObservationQueue
     int dominant_class_id_ = -1;
     size_t dominant_class_size_ = 0;
     double decay_time_;
+    // When true the "dominant class" is the one with the highest class id rather
+    // than the most observations, and queues of other classes are kept (not
+    // purged). Used by direct-cost mode, where class id == cost, so the tile
+    // reports the worst (safest) non-decayed score.
+    bool prefer_max_class_id_ = false;
 
    public:
     TemporalObservationQueue() {}
+
+    /**
+     * @brief Select "highest class id wins" instead of "most observations wins".
+     */
+    void setPreferMaxClassId(bool prefer) { prefer_max_class_id_ = prefer; }
 
     /**
      * @brief Adds an observation to the appropriate class queue, manages dominant class tracking.
@@ -147,19 +174,24 @@ class TemporalObservationQueue
         
         if (dominant_priority) {
             should_become_dominant = true;
+        } else if (prefer_max_class_id_) {
+            // Direct-cost mode: highest class id (== highest cost) wins.
+            should_become_dominant = (static_cast<int>(class_id) > dominant_class_id_);
         } else {
             //logic for non-dominant_priority classes: only compete by size
             should_become_dominant = (current_class_size > dominant_class_size_);
         }
-        
+
         if (should_become_dominant)
         {
-            // New dominant class - purge all other classes
-            if (dominant_class_id_ != -1 && dominant_class_id_ != class_id)
+            // New dominant class - purge all other classes. Skipped in
+            // prefer_max_class_id_ mode so lower-cost queues remain as a
+            // fallback once the current worst score decays.
+            if (!prefer_max_class_id_ && dominant_class_id_ != -1 && dominant_class_id_ != class_id)
             {
                 clearQueuesExcept(class_id);
             }
-            
+
             // Update dominance
             setDominant(class_id, current_class_size);
         }
@@ -309,7 +341,10 @@ private:
         resetDominant();
         for (const auto& pair : class_queues_)
         {
-            if (pair.second.size() > dominant_class_size_)
+            const bool better = prefer_max_class_id_
+              ? (static_cast<int>(pair.first) > dominant_class_id_)
+              : (pair.second.size() > dominant_class_size_);
+            if (better)
             {
                 setDominant(pair.first, pair.second.size());
             }
@@ -345,6 +380,7 @@ class SegmentationTileMap {
         float resolution_;
         float decay_time_;
         std::recursive_mutex lock_;
+        bool prefer_max_class_id_ = false;
 
 
     public:
@@ -431,9 +467,17 @@ class SegmentationTileMap {
                 // TileIndex does not exist, create a new TemporalObservationQueue with decay time
                 TemporalObservationQueue& queue = tile_map_[idx];
                 queue.setDecayTime(decay_time_);
+                queue.setPreferMaxClassId(prefer_max_class_id_);
                 queue.push(obs, dominant_priority);
             }
         }
+
+        /**
+         * @brief Make every tile's queue resolve dominance by highest class id
+         * (== highest cost) instead of by observation count. Call before any
+         * observations are pushed.
+         */
+        void setPreferMaxClassId(bool prefer) { prefer_max_class_id_ = prefer; }
 
         /**
          * @brief Removes observations older than the decay time from all tiles.
@@ -678,7 +722,8 @@ class SegmentationBuffer
                        double expected_update_rate, double max_lookahead_distance, double min_lookahead_distance,
                        tf2_ros::Buffer& tf2_buffer, std::string global_frame, std::string sensor_frame,
                        tf2::Duration tf_tolerance, double costmap_resolution, double tile_map_decay_time, bool visualize_tile_map = false,
-                       bool use_cost_selection = true);
+                       bool use_cost_selection = true, bool project_pointcloud = false,
+                       std::string camera_optical_frame = "");
 
     /**
      * @brief  Destructor... cleans up
@@ -699,6 +744,50 @@ class SegmentationBuffer
      */
     void bufferSegmentation(const sensor_msgs::msg::PointCloud2& cloud, const sensor_msgs::msg::Image& segmentation,
                             const sensor_msgs::msg::Image& confidence);
+
+    /**
+     * @brief Cache the intrinsics of the segmentation camera (LiDAR-projection mode only).
+     * Thread-safe. Called from the CameraInfo subscription in the layer.
+     */
+    void setCameraInfo(const sensor_msgs::msg::CameraInfo& info);
+
+    /**
+     * @brief True when this buffer projects an unorganized LiDAR cloud into the
+     * segmentation image using camera intrinsics, instead of consuming a
+     * pixel-aligned RGBD cloud.
+     */
+    bool isProjectionMode() const { return project_pointcloud_; }
+
+    /**
+     * @brief Build the class-name -> class-id -> cost map directly from a
+     * name->id map, for setups that don't publish a vision_msgs/LabelInfo.
+     */
+    void createSegmentationCostMultimapFromIds(
+      const std::unordered_map<std::string, uint8_t>& class_name_to_id);
+
+    /**
+     * @brief Enable score-threshold interpretation of the mask. When set, mask
+     * pixels are mapped to a class id by which range contains their value
+     * (first match wins) instead of being treated as a class id directly.
+     * Pass an empty vector to keep the default (pixel value == class id).
+     */
+    void setValueRanges(const std::vector<SegmentationValueRange>& ranges);
+
+    /**
+     * @brief Enable direct-cost mode: the mask pixel value is mapped straight to
+     * a costmap cost, with no class binning. cost = clamp(scale * (1 - v/255) +
+     * offset, 0, 254). With the default scale=254, offset=0 that is v=255 -> 0
+     * (free), v=0 -> 254 (lethal), linear in between. Pixels whose value is in
+     * [ignore_lo, ignore_hi] (when both >= 0) are treated as unknown and dropped.
+     * Each tile then reports the worst (highest) non-decayed cost.
+     */
+    void setDirectCostMapping(double scale, double offset, int ignore_lo, int ignore_hi);
+
+    /**
+     * @brief Resolve a raw mono8 mask value to a class id.
+     * @return the class id, or -1 if the value maps to no known class.
+     */
+    int resolveClassId(uint8_t pixel_value) const;
 
     /**
      * @brief  gets the class map associated with the segmentations stored in the buffer
@@ -771,6 +860,26 @@ class SegmentationBuffer
      */
     void purgeStaleSegmentations();
 
+    /**
+     * @brief LiDAR-projection variant of bufferSegmentation(). Transforms an
+     * unorganized cloud with TF2 (LiDAR frame -> camera projection frame),
+     * projects each valid point with the cached intrinsics, samples the
+     * segmentation mask at the resulting pixel and buffers the observation.
+     * See the frame notes in camera_projection.hpp: rgb_camera_frame is the
+     * PHYSICAL camera frame, not a ROS optical frame.
+     */
+    void bufferProjectedSegmentation(const sensor_msgs::msg::PointCloud2& cloud,
+                                     const sensor_msgs::msg::Image& segmentation,
+                                     const sensor_msgs::msg::Image& confidence);
+
+    /**
+     * @brief Shared tail of both buffering paths: purge decayed observations and
+     * push the best observation selected for each tile this frame.
+     */
+    void commitObservations(const std::unordered_map<TileIndex, int>& best_observations_idxs,
+                            const sensor_msgs::msg::Image& segmentation,
+                            const sensor_msgs::msg::Image& confidence, double cloud_time_seconds);
+
     rclcpp::Clock::SharedPtr clock_;
     rclcpp::Logger logger_{rclcpp::get_logger("nav2_costmap_2d")};
     tf2_ros::Buffer& tf2_buffer_;
@@ -796,6 +905,27 @@ class SegmentationBuffer
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr tile_map_pub_;
     // If true, select observation per tile using highest max_cost. If false, use highest confidence
     bool use_cost_selection_ = true;
+
+    // LiDAR-projection mode
+    bool project_pointcloud_ = false;
+    // Optional REP-103 optical frame to project in. When empty, points are
+    // transformed into the CameraInfo frame_id and CameraProjection's
+    // physical->optical convention is applied by hand.
+    std::string camera_optical_frame_;
+    CameraProjection camera_projection_;
+    std::string camera_info_frame_;
+
+    // Empty => mask pixel value is the class id directly. Non-empty => pixel
+    // value is a score, mapped to a class id by range (first match wins).
+    std::vector<SegmentationValueRange> value_ranges_;
+
+    // Direct-cost mode: pixel value -> cost, no class binning. resolveClassId()
+    // returns the cost itself (0..254) so the tile machinery keys on it.
+    bool direct_cost_ = false;
+    double direct_cost_scale_ = 254.0;
+    double direct_cost_offset_ = 0.0;
+    int direct_cost_ignore_lo_ = -1;
+    int direct_cost_ignore_hi_ = -1;
 };
 }  // namespace semantic_segmentation_layer
 #endif  // SEMANTIC_SEGMENTATION_LAYER__SEGMENTATION_BUFFER_HPP_

@@ -1,0 +1,118 @@
+# Example Nav2 local costmap using the semantic segmentation layer in
+# LiDAR-projection mode, wired to this robot's topics:
+#
+#   /lidar/points                    sensor_msgs/PointCloud2  (unorganized LiDAR)
+#   /segmentation_mask/image_raw      sensor_msgs/Image mono8  (traversability SCORE 0-255)
+#   /segmentation_mask/camera_info    sensor_msgs/CameraInfo   (segmentation intrinsics)
+#
+# The mask from zeta_seg / qwen is a continuous score: ~255 = traversable,
+# ~128 = neutral/unknown, ~0 = non-traversable (node maps a [-1,1] score with
+# `(score + 1) * 127.5`).
+#
+# This config uses `direct_cost: true` -- the mask value is mapped straight to a
+# costmap cost with no class binning:
+#   cost = clamp(direct_cost_scale * (1 - value/255) + direct_cost_offset, 0, 254)
+# so value 255 -> cost 0 (free), value 0 -> cost 254 (lethal), linear between.
+# Each tile reports the worst (highest) cost seen in the last tile_map_decay_time
+# seconds. Two alternatives are shown commented out below:
+#   * class_types + value_min/value_max: bin the score into named classes
+#   * class_types + class_ids: exact match, for a strictly binary 0/255 mask
+#
+# TF tree (from `ros2 run tf2_tools view_frames`):
+#   odom -> base_link -> rgb_camera_frame   (PHYSICAL camera frame: +x fwd, +y left, +z up)
+#                     -> lidar_frame
+# There is no optical frame, so `camera_optical_frame` is left empty and the
+# layer transforms LiDAR points into rgb_camera_frame via TF, then applies the
+# physical->optical axis convention before projecting. If you later add a real
+# REP-103 optical frame to your URDF, set `camera_optical_frame` to it and the
+# hand-rolled swap is skipped.
+
+# NOTE: the standalone `nav2_costmap_2d` node is named `costmap`. When you fold
+# this layer into a full Nav2 stack instead, move the `plugins` / `*_layer`
+# blocks under your existing `local_costmap.local_costmap.ros__parameters`.
+costmap:
+  costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 120
+      height: 120
+      resolution: 0.5
+      robot_radius: 0.0
+      track_unknown_space: false
+      transform_tolerance: 0.3
+      # Republish the whole grid every cycle so `ros2 topic hz /costmap/costmap`
+      # and RViz show it even when the scene isn't changing. In a real stack you
+      # normally leave this false and consume /costmap/costmap_updates.
+      always_send_full_costmap: true
+
+      plugins: ["segmentation_layer"]
+
+      segmentation_layer:
+        plugin: "semantic_segmentation_layer::SemanticSegmentationLayer"
+        enabled: true
+        combination_method: 1          # 0 overwrite, 1 max
+        observation_sources: lidar_camera
+
+        lidar_camera:
+          # --- LiDAR-projection mode ---
+          project_pointcloud: true
+          pointcloud_topic: "/lidar/points"
+          segmentation_topic: "/segmentation_mask/image_raw"
+          camera_info_topic: "/segmentation_mask/camera_info"
+          confidence_topic: ""           # no confidence stream
+          labels_topic: ""               # no vision_msgs/LabelInfo; use class_ids below
+
+          # Empty -> project from the CameraInfo frame_id (rgb_camera_frame) with
+          # the physical->optical swap. Set to a real optical frame if you have one.
+          camera_optical_frame: ""
+
+          # LiDAR and camera stamps never match exactly -> approximate time sync.
+          approximate_sync: true
+          approximate_sync_tolerance: 0.05
+
+          # Range gate (metres) applied in the global frame.
+          min_obstacle_distance: 0.3
+          max_obstacle_distance: 20.0
+
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          tile_map_decay_time: 3.0
+          visualize_tile_map: false
+
+          # --- Direct cost: mask value -> costmap cost, no class binning ---
+          direct_cost: true
+          direct_cost_scale: 254.0        # cost span (0..254)
+          direct_cost_offset: 0.0         # bias; use a negative scale to invert
+          direct_cost_ignore_min: -1      # e.g. 120 / 140 to drop an "unknown"
+          direct_cost_ignore_max: -1      #   score band instead of costing it
+          # (class_types / class_ids are not needed when direct_cost is true)
+
+          # --- Alternative A: threshold the score into named classes ---
+          # direct_cost: false
+          # use_cost_selection: true
+          # class_types: ["obstacle", "traversable"]
+          # obstacle:
+          #   classes: ["obstacle"]
+          #   class_ids: [1]
+          #   value_min: 0
+          #   value_max: 130
+          #   base_cost: 254
+          #   max_cost: 254
+          #   dominant_priority: true
+          # traversable:
+          #   classes: ["traversable"]
+          #   class_ids: [2]
+          #   value_min: 146
+          #   value_max: 255
+          #   base_cost: 0
+          #   max_cost: 0
+          #
+          # --- Alternative B: strictly binary 0 / 255 mask ---
+          # direct_cost: false
+          # class_types: ["traversable", "obstacle"]
+          # traversable: {classes: ["traversable"], class_ids: [255], base_cost: 0}
+          # obstacle:    {classes: ["obstacle"],    class_ids: [0],   base_cost: 254, dominant_priority: true}

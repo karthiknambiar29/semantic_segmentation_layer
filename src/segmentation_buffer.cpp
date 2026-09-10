@@ -57,7 +57,8 @@ SegmentationBuffer::SegmentationBuffer(const nav2_util::LifecycleNode::WeakPtr& 
                                        double min_lookahead_distance, tf2_ros::Buffer& tf2_buffer,
                                        std::string global_frame, std::string sensor_frame,
                                        tf2::Duration tf_tolerance, double costmap_resolution, double tile_map_decay_time, bool visualize_tile_map,
-                                       bool use_cost_selection)
+                                       bool use_cost_selection, bool project_pointcloud,
+                                       std::string camera_optical_frame)
   : tf2_buffer_(tf2_buffer)
   , class_types_(class_types)
   , class_names_cost_map_(class_names_cost_map)
@@ -78,6 +79,15 @@ SegmentationBuffer::SegmentationBuffer(const nav2_util::LifecycleNode::WeakPtr& 
   temporal_tile_map_ = std::make_shared<SegmentationTileMap>(costmap_resolution, tile_map_decay_time);
   visualize_tile_map_ = visualize_tile_map;
   use_cost_selection_ = use_cost_selection;
+  project_pointcloud_ = project_pointcloud;
+  camera_optical_frame_ = camera_optical_frame;
+  if (project_pointcloud_)
+  {
+    RCLCPP_INFO(logger_, "SegmentationBuffer [%s]: LiDAR-projection mode ON. Projection frame = %s",
+                buffer_source_.c_str(),
+                camera_optical_frame_.empty() ? "<CameraInfo frame_id> + physical->optical swap"
+                                              : camera_optical_frame_.c_str());
+  }
   RCLCPP_INFO(logger_, "SegmentationBuffer [%s]: Selection method = %s", 
               buffer_source_.c_str(), 
               use_cost_selection_ ? "COST-BASED (max_cost)" : "CONFIDENCE-BASED");
@@ -106,11 +116,114 @@ void SegmentationBuffer::createSegmentationCostMultimap(const vision_msgs::msg::
   segmentation_cost_multimap_ = std::make_shared<SegmentationCostMultimap>(class_to_id_map, class_names_cost_map_);
 }
 
+void SegmentationBuffer::createSegmentationCostMultimapFromIds(
+  const std::unordered_map<std::string, uint8_t>& class_name_to_id)
+{
+  segmentation_cost_multimap_ =
+    std::make_shared<SegmentationCostMultimap>(class_name_to_id, class_names_cost_map_);
+  RCLCPP_INFO(logger_,
+              "SegmentationBuffer [%s]: class id map built from parameters (no LabelInfo topic).",
+              buffer_source_.c_str());
+}
+
+void SegmentationBuffer::setValueRanges(const std::vector<SegmentationValueRange>& ranges)
+{
+  value_ranges_ = ranges;
+  if (!value_ranges_.empty())
+  {
+    RCLCPP_INFO(logger_,
+                "SegmentationBuffer [%s]: score-threshold mode ON (%zu value ranges); mask pixels "
+                "are interpreted as a 0-255 score, not a class id.",
+                buffer_source_.c_str(), value_ranges_.size());
+  }
+}
+
+void SegmentationBuffer::setDirectCostMapping(double scale, double offset, int ignore_lo,
+                                             int ignore_hi)
+{
+  direct_cost_ = true;
+  direct_cost_scale_ = scale;
+  direct_cost_offset_ = offset;
+  direct_cost_ignore_lo_ = ignore_lo;
+  direct_cost_ignore_hi_ = ignore_hi;
+
+  // One "class" per possible cost (0..254), each mapping to itself, so the
+  // existing tile / cost machinery works unchanged.
+  std::unordered_map<std::string, uint8_t> name_to_id;
+  std::unordered_map<std::string, CostHeuristicParams> name_to_cost;
+  for (int i = 0; i <= 254; ++i)
+  {
+    const std::string name = "cost_" + std::to_string(i);
+    name_to_id[name] = static_cast<uint8_t>(i);
+    name_to_cost[name] =
+      CostHeuristicParams{static_cast<uint8_t>(i), static_cast<uint8_t>(i), 0, 0, false};
+  }
+  segmentation_cost_multimap_ = std::make_shared<SegmentationCostMultimap>(name_to_id, name_to_cost);
+
+  // Tile dominance = highest cost among non-decayed observations (worst / safest).
+  temporal_tile_map_->setPreferMaxClassId(true);
+
+  RCLCPP_INFO(logger_,
+              "SegmentationBuffer [%s]: direct-cost mode ON (cost = clamp(%.1f*(1-v/255)+%.1f, "
+              "0, 254)); no class binning.",
+              buffer_source_.c_str(), direct_cost_scale_, direct_cost_offset_);
+}
+
+int SegmentationBuffer::resolveClassId(uint8_t pixel_value) const
+{
+  if (direct_cost_)
+  {
+    if (direct_cost_ignore_lo_ >= 0 && direct_cost_ignore_hi_ >= direct_cost_ignore_lo_ &&
+        pixel_value >= direct_cost_ignore_lo_ && pixel_value <= direct_cost_ignore_hi_)
+    {
+      return -1;  // unknown band -> drop
+    }
+    double cost = direct_cost_scale_ * (1.0 - static_cast<double>(pixel_value) / 255.0) +
+                  direct_cost_offset_;
+    int c = static_cast<int>(std::lround(cost));
+    return std::max(0, std::min(254, c));
+  }
+  if (value_ranges_.empty())
+  {
+    // Default: the pixel value is the class id (255 traversable / 0 obstacle...).
+    return segmentation_cost_multimap_->hasClassId(pixel_value) ? static_cast<int>(pixel_value) : -1;
+  }
+  // Score mask: first range that contains the value wins.
+  for (const auto& range : value_ranges_)
+  {
+    if (pixel_value >= range.lo && pixel_value <= range.hi)
+    {
+      return static_cast<int>(range.class_id);
+    }
+  }
+  return -1;  // value falls in a gap (e.g. an "uncertain" band) -> ignore
+}
+
+void SegmentationBuffer::setCameraInfo(const sensor_msgs::msg::CameraInfo& info)
+{
+  std::lock_guard<std::recursive_mutex> lock(lock_);
+  if (!camera_projection_.fromCameraInfo(info))
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000,
+                         "SegmentationBuffer [%s]: received an unusable CameraInfo "
+                         "(zero size / intrinsics). Ignoring.",
+                         buffer_source_.c_str());
+    return;
+  }
+  camera_info_frame_ = info.header.frame_id;
+}
+
 void SegmentationBuffer::bufferSegmentation(
   const sensor_msgs::msg::PointCloud2& cloud,
   const sensor_msgs::msg::Image& segmentation,
   const sensor_msgs::msg::Image& confidence)
 {
+  if (project_pointcloud_)
+  {
+    bufferProjectedSegmentation(cloud, segmentation, confidence);
+    return;
+  }
+
   geometry_msgs::msg::PointStamped global_origin;
   // check whether the origin frame has been set explicitly
   // or whether we should get it from the cloud
@@ -172,15 +285,17 @@ void SegmentationBuffer::bufferSegmentation(
         auto it = best_observations_idxs.find(costmap_index);
         if (it != best_observations_idxs.end()) {
           if (use_cost_selection_) {
-            // Cost-based: pick highest max_cost
-            uint8_t current_class = segmentation.data[pixel_idx];
-            uint8_t existing_class = segmentation.data[it->second];
-            auto current_cost = segmentation_cost_multimap_->getCostById(current_class);
-            auto existing_cost = segmentation_cost_multimap_->getCostById(existing_class);
-            if (current_cost.max_cost > existing_cost.max_cost) {
+            // Cost-based: pick highest max_cost (of the resolved class).
+            int current_class = resolveClassId(segmentation.data[pixel_idx]);
+            int existing_class = resolveClassId(segmentation.data[it->second]);
+            uint8_t current_max = current_class >= 0
+              ? segmentation_cost_multimap_->getCostById(current_class).max_cost : 0;
+            uint8_t existing_max = existing_class >= 0
+              ? segmentation_cost_multimap_->getCostById(existing_class).max_cost : 0;
+            if (current_max > existing_max) {
               best_observations_idxs[costmap_index] = pixel_idx;
-              RCLCPP_DEBUG(logger_, "COST-BASED: Replaced tile observation - current_class=%d (max_cost=%d) > existing_class=%d (max_cost=%d)", 
-                          current_class, current_cost.max_cost, existing_class, existing_cost.max_cost);
+              RCLCPP_DEBUG(logger_, "COST-BASED: Replaced tile observation - current_class=%d (max_cost=%d) > existing_class=%d (max_cost=%d)",
+                          current_class, current_max, existing_class, existing_max);
             }
           } else {
             // Confidence-based: pick highest confidence
@@ -199,32 +314,7 @@ void SegmentationBuffer::bufferSegmentation(
       }
     }
 
-    // emplace the best observations in the mask into the tile map
-    temporal_tile_map_->lock();
-    temporal_tile_map_->purgeOldObservations(cloud_time_seconds);
-    for (auto& idx : best_observations_idxs)
-    {
-      int img_idx_for_best_obs = idx.second;
-      TileIndex costmap_index = idx.first;
-      uint8_t class_id = segmentation.data[img_idx_for_best_obs];
-      
-      // Only process observations with defined class IDs
-      if (segmentation_cost_multimap_->hasClassId(class_id)) {
-        TileObservation best_obs{class_id, static_cast<float>(confidence.data[img_idx_for_best_obs]), cloud_time_seconds};
-        bool dominant_priority = segmentation_cost_multimap_->getCostById(class_id).dominant_priority;
-        temporal_tile_map_->pushObservation(best_obs, costmap_index, dominant_priority);
-      } else {
-        RCLCPP_DEBUG(logger_, "SegmentationBuffer [%s]: Skipping undefined class_id %d in tile (%d, %d)", 
-                      buffer_source_.c_str(), class_id, costmap_index.x, costmap_index.y);
-      }
-    }
-    temporal_tile_map_->unlock();
-
-    if(visualize_tile_map_)
-    {
-      sensor_msgs::msg::PointCloud2 tile_map_cloud = visualizeTemporalTileMap(*temporal_tile_map_);
-      tile_map_pub_->publish(tile_map_cloud);
-    }
+    commitObservations(best_observations_idxs, segmentation, confidence, cloud_time_seconds);
 
   } catch (tf2::TransformException& ex)
   {
@@ -235,6 +325,200 @@ void SegmentationBuffer::bufferSegmentation(
   }
 
   // if the update was successful, we want to update the last updated time
+  last_updated_ = clock_->now();
+}
+
+void SegmentationBuffer::commitObservations(
+  const std::unordered_map<TileIndex, int>& best_observations_idxs,
+  const sensor_msgs::msg::Image& segmentation, const sensor_msgs::msg::Image& confidence,
+  double cloud_time_seconds)
+{
+  temporal_tile_map_->lock();
+  temporal_tile_map_->purgeOldObservations(cloud_time_seconds);
+  for (const auto& idx : best_observations_idxs)
+  {
+    int img_idx_for_best_obs = idx.second;
+    TileIndex costmap_index = idx.first;
+    // Resolve the raw mask value to a class id: identity for a class-id mask
+    // (255 traversable / 0 obstacle...), or range lookup for a score mask.
+    int class_id = resolveClassId(segmentation.data[img_idx_for_best_obs]);
+
+    if (class_id >= 0) {
+      TileObservation best_obs{static_cast<uint8_t>(class_id),
+                               static_cast<float>(confidence.data[img_idx_for_best_obs]),
+                               cloud_time_seconds};
+      bool dominant_priority = segmentation_cost_multimap_->getCostById(class_id).dominant_priority;
+      temporal_tile_map_->pushObservation(best_obs, costmap_index, dominant_priority);
+    } else {
+      RCLCPP_DEBUG(logger_,
+                   "SegmentationBuffer [%s]: Skipping unmapped mask value %d in tile (%d, %d)",
+                   buffer_source_.c_str(), segmentation.data[img_idx_for_best_obs], costmap_index.x,
+                   costmap_index.y);
+    }
+  }
+  temporal_tile_map_->unlock();
+
+  if (visualize_tile_map_)
+  {
+    sensor_msgs::msg::PointCloud2 tile_map_cloud = visualizeTemporalTileMap(*temporal_tile_map_);
+    tile_map_pub_->publish(tile_map_cloud);
+  }
+}
+
+void SegmentationBuffer::bufferProjectedSegmentation(
+  const sensor_msgs::msg::PointCloud2& cloud, const sensor_msgs::msg::Image& segmentation,
+  const sensor_msgs::msg::Image& confidence)
+{
+  if (!camera_projection_.valid())
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+                         "SegmentationBuffer [%s]: no usable CameraInfo received yet, cannot "
+                         "project LiDAR points. Skipping cloud.",
+                         buffer_source_.c_str());
+    return;
+  }
+  if (camera_projection_.width() != segmentation.width ||
+      camera_projection_.height() != segmentation.height)
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+                         "SegmentationBuffer [%s]: CameraInfo size (%ux%u) != segmentation image "
+                         "size (%ux%u). Skipping cloud.",
+                         buffer_source_.c_str(), camera_projection_.width(),
+                         camera_projection_.height(), segmentation.width, segmentation.height);
+    return;
+  }
+
+  // Frame the LiDAR points must be projected from. When an explicit optical
+  // frame is configured we let TF put the points straight into it. Otherwise we
+  // transform into the physical camera frame advertised by CameraInfo
+  // (e.g. "rgb_camera_frame") and apply the repo's physical->optical axis
+  // convention by hand, because that frame is NOT a REP-103 optical frame and
+  // this robot's TF tree has no optical frame at all.
+  const bool have_optical_frame = !camera_optical_frame_.empty();
+  const std::string projection_frame =
+    have_optical_frame ? camera_optical_frame_ : camera_info_frame_;
+  if (projection_frame.empty())
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+                         "SegmentationBuffer [%s]: no projection frame known yet. Skipping cloud.",
+                         buffer_source_.c_str());
+    return;
+  }
+
+  const int width = static_cast<int>(segmentation.width);
+  const int height = static_cast<int>(segmentation.height);
+  const double cloud_time_seconds =
+    rclcpp::Time(cloud.header.stamp.sec, cloud.header.stamp.nanosec).seconds();
+
+  try
+  {
+    // Sensor origin in the global frame, for the range gate (same semantics as
+    // the aligned path).
+    geometry_msgs::msg::PointStamped local_origin, global_origin;
+    local_origin.header.stamp = cloud.header.stamp;
+    local_origin.header.frame_id = cloud.header.frame_id;
+    local_origin.point.x = local_origin.point.y = local_origin.point.z = 0.0;
+    tf2_buffer_.transform(local_origin, global_origin, global_frame_, tf_tolerance_);
+
+    // Two views of the same cloud: one for tile binning, one for projection.
+    // tf2 preserves point order, so both can be iterated in lockstep.
+    sensor_msgs::msg::PointCloud2 global_cloud, camera_cloud;
+    tf2_buffer_.transform(cloud, global_cloud, global_frame_, tf_tolerance_);
+    tf2_buffer_.transform(cloud, camera_cloud, projection_frame, tf_tolerance_);
+
+    sensor_msgs::PointCloud2ConstIterator<float> gx(global_cloud, "x"), gy(global_cloud, "y"),
+      gz(global_cloud, "z");
+    sensor_msgs::PointCloud2ConstIterator<float> cx(camera_cloud, "x"), cy(camera_cloud, "y"),
+      cz(camera_cloud, "z");
+
+    std::unordered_map<TileIndex, int> best_observations_idxs;
+    const size_t n_points = static_cast<size_t>(camera_cloud.width) * camera_cloud.height;
+
+    for (size_t i = 0; i < n_points; ++i, ++gx, ++gy, ++gz, ++cx, ++cy, ++cz)
+    {
+      // Drop invalid / NaN / Inf points in either representation.
+      if (!std::isfinite(*cx) || !std::isfinite(*cy) || !std::isfinite(*cz) ||
+          !std::isfinite(*gx) || !std::isfinite(*gy) || !std::isfinite(*gz))
+      {
+        continue;
+      }
+
+      // Into the optical convention expected by CameraProjection::project().
+      double ox, oy, oz;
+      if (have_optical_frame)
+      {
+        ox = *cx;
+        oy = *cy;
+        oz = *cz;
+      }
+      else
+      {
+        CameraProjection::opticalFromPhysical(*cx, *cy, *cz, ox, oy, oz);
+      }
+
+      // Project. Returns false for points on/behind the image plane.
+      double u_d, v_d;
+      if (!camera_projection_.project(ox, oy, oz, u_d, v_d))
+      {
+        continue;
+      }
+      const int u = static_cast<int>(std::lround(u_d));
+      const int v = static_cast<int>(std::lround(v_d));
+      if (u < 0 || v < 0 || u >= width || v >= height)
+      {
+        continue;
+      }
+
+      // Range gate in the global frame.
+      const double sq_dist = std::pow(*gx - global_origin.point.x, 2) +
+                             std::pow(*gy - global_origin.point.y, 2) +
+                             std::pow(*gz - global_origin.point.z, 2);
+      if (sq_dist >= sq_max_lookahead_distance_ || sq_dist <= sq_min_lookahead_distance_)
+      {
+        continue;
+      }
+
+      const int pixel_idx = v * width + u;
+      const TileIndex costmap_index = temporal_tile_map_->worldToIndex(*gx, *gy);
+
+      // One observation per tile per frame. Many LiDAR points can land on the
+      // same pixel / tile; keep one using the same policy as the aligned path.
+      auto it = best_observations_idxs.find(costmap_index);
+      if (it == best_observations_idxs.end())
+      {
+        best_observations_idxs[costmap_index] = pixel_idx;
+        continue;
+      }
+      if (use_cost_selection_)
+      {
+        int current_class = resolveClassId(segmentation.data[pixel_idx]);
+        int existing_class = resolveClassId(segmentation.data[it->second]);
+        uint8_t current_max = current_class >= 0
+          ? segmentation_cost_multimap_->getCostById(current_class).max_cost : 0;
+        uint8_t existing_max = existing_class >= 0
+          ? segmentation_cost_multimap_->getCostById(existing_class).max_cost : 0;
+        if (current_max > existing_max)
+        {
+          it->second = pixel_idx;
+        }
+      }
+      else if (confidence.data[pixel_idx] > confidence.data[it->second])
+      {
+        it->second = pixel_idx;
+      }
+    }
+
+    commitObservations(best_observations_idxs, segmentation, confidence, cloud_time_seconds);
+  }
+  catch (const tf2::TransformException& ex)
+  {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+                         "SegmentationBuffer [%s]: TF error projecting LiDAR (%s -> %s / %s): %s",
+                         buffer_source_.c_str(), cloud.header.frame_id.c_str(),
+                         global_frame_.c_str(), projection_frame.c_str(), ex.what());
+    return;
+  }
+
   last_updated_ = clock_->now();
 }
 

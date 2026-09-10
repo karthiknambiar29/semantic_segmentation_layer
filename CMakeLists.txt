@@ -12,7 +12,6 @@ find_package(geometry_msgs REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(nav2_util REQUIRED)
-find_package(nav2_util REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -25,7 +24,24 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
 find_package(vision_msgs REQUIRED)
 
-# Include directories
+set(dependencies
+  geometry_msgs
+  message_filters
+  nav2_costmap_2d
+  nav2_util
+  nav_msgs
+  pluginlib
+  rclcpp
+  rclcpp_lifecycle
+  sensor_msgs
+  std_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  tf2_sensor_msgs
+  vision_msgs
+)
+
 include_directories(include)
 
 # Create the semantic segmentation layer library
@@ -40,20 +56,9 @@ target_include_directories(semantic_segmentation_layer
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(semantic_segmentation_layer
-  PUBLIC
-    message_filters::message_filters
-    nav2_costmap_2d::nav2_costmap_2d_core
-    nav2_util::nav2_util_core
-    nav2_util::nav2_util_core
-    pluginlib::pluginlib
-    rclcpp::rclcpp
-    rclcpp_lifecycle::rclcpp_lifecycle
-    tf2::tf2
-    tf2_ros::tf2_ros
-    tf2_sensor_msgs::tf2_sensor_msgs
-    ${vision_msgs_TARGETS}
-)
+# Humble ships classic (non-namespaced) ament CMake config for these packages,
+# so resolve them through ament_target_dependencies rather than imported targets.
+ament_target_dependencies(semantic_segmentation_layer ${dependencies})
 
 # Install library
 install(TARGETS semantic_segmentation_layer
@@ -67,18 +72,30 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
-# Install plugin description file
+# Install plugin description, example config and launch files
 install(FILES costmap_plugins.xml
   DESTINATION share/${PROJECT_NAME}
+)
+install(DIRECTORY config launch
+  DESTINATION share/${PROJECT_NAME}
+)
+# fake_inputs.py is referenced by the launch file for a robot-free smoke test
+install(PROGRAMS test/fake_inputs.py
+  DESTINATION share/${PROJECT_NAME}/test
 )
 
 # Export plugin description file for pluginlib
 pluginlib_export_plugin_description_file(nav2_costmap_2d costmap_plugins.xml)
 
+ament_export_include_directories(include)
+ament_export_libraries(semantic_segmentation_layer)
+ament_export_dependencies(${dependencies})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+  find_package(ament_cmake_gtest REQUIRED)
+  add_subdirectory(test)
 endif()
 
 ament_package()
-

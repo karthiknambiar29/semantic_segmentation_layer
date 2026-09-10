@@ -44,12 +44,15 @@
 #include "rclcpp/rclcpp.hpp"
 
 #include "message_filters/subscriber.hpp"
+#include "message_filters/synchronizer.hpp"
+#include "message_filters/sync_policies/approximate_time.hpp"
 #include "message_filters/time_synchronizer.hpp"
 #include "nav2_costmap_2d/costmap_layer.hpp"
 #include "nav2_costmap_2d/layer.hpp"
 #include "nav2_costmap_2d/layered_costmap.hpp"
 #include "semantic_segmentation_layer/segmentation_buffer.hpp"
 #include "nav2_util/node_utils.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "tf2_ros/message_filter.hpp"
 #include "vision_msgs/msg/label_info.hpp"
@@ -160,6 +163,20 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
     std::vector<
         std::shared_ptr<message_filters::TimeSynchronizer<sensor_msgs::msg::Image, sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud2>>>
         segm_conf_pc_notifiers_;
+
+    // Approximate-time synchronizers, used when timestamps don't line up exactly
+    // (always the case for a separate LiDAR + segmentation camera).
+    using ApproxSegmPcPolicy =
+        message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud2>;
+    using ApproxSegmConfPcPolicy =
+        message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::Image,
+                                                       sensor_msgs::msg::PointCloud2>;
+    std::vector<std::shared_ptr<message_filters::Synchronizer<ApproxSegmPcPolicy>>> segm_pc_approx_notifiers_;
+    std::vector<std::shared_ptr<message_filters::Synchronizer<ApproxSegmConfPcPolicy>>>
+        segm_conf_pc_approx_notifiers_;
+
+    std::vector<rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr> camera_info_subs_;
+
     std::vector<std::shared_ptr<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>> pointcloud_tf_subs_;
 
     // debug publishers
