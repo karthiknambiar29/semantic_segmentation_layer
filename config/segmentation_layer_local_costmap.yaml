@@ -37,10 +37,12 @@ costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
-      rolling_window: true
-      width: 120
-      height: 120
+      rolling_window: false
+      width: 250
+      height: 250
       resolution: 0.5
+      origin_x: -125.0
+      origin_y: -125.0
       robot_radius: 0.0
       track_unknown_space: false
       transform_tolerance: 0.3
