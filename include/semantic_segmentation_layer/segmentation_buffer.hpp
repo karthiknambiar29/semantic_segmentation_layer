@@ -66,6 +66,9 @@ struct CostHeuristicParams
     uint8_t base_cost, max_cost, mark_confidence;
     int samples_to_max_cost;
     bool dominant_priority;
+    // Points of this class that must land on a tile in one frame before the class
+    // can claim the tile for that frame. 1 = any single point counts.
+    int min_points_per_tile = 1;
 };
 
 /**
@@ -871,6 +874,26 @@ class SegmentationBuffer
     void bufferProjectedSegmentation(const sensor_msgs::msg::PointCloud2& cloud,
                                      const sensor_msgs::msg::Image& segmentation,
                                      const sensor_msgs::msg::Image& confidence);
+
+    // Per tile, per class id: {points seen this frame, highest-confidence pixel}.
+    using TileCandidates =
+      std::unordered_map<TileIndex, std::unordered_map<int, std::pair<int, int>>>;
+
+    /**
+     * @brief Count one mask pixel towards its class on a tile for this frame.
+     * Pixels whose value resolves to no class are dropped.
+     */
+    void addCandidate(TileCandidates& candidates, const TileIndex& tile, int pixel_idx,
+                      const sensor_msgs::msg::Image& segmentation,
+                      const sensor_msgs::msg::Image& confidence) const;
+
+    /**
+     * @brief Pick one pixel per tile: only classes with >= min_points_per_tile
+     * points compete; among those, highest max_cost (use_cost_selection) or
+     * highest confidence wins, ties go to the class with more points.
+     */
+    std::unordered_map<TileIndex, int> selectObservations(
+      const TileCandidates& candidates, const sensor_msgs::msg::Image& confidence) const;
 
     /**
      * @brief Shared tail of both buffering paths: purge decayed observations and

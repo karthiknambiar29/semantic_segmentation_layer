@@ -113,11 +113,13 @@ protected:
   }
 
   // camera_optical_frame empty -> physical(rgb_camera_frame) + optical swap path.
-  std::unique_ptr<SegmentationBuffer> makeBuffer(const std::string & optical_frame = "")
+  std::unique_ptr<SegmentationBuffer> makeBuffer(
+    const std::string & optical_frame = "", bool use_cost_selection = false,
+    int obstacle_min_points = 1)
   {
     std::unordered_map<std::string, CostHeuristicParams> cost_map{
       {"traversable", CostHeuristicParams{0, 0, 0, 0, false}},
-      {"obstacle", CostHeuristicParams{254, 254, 0, 0, false}}};
+      {"obstacle", CostHeuristicParams{254, 254, 0, 0, false, obstacle_min_points}}};
     std::unordered_map<std::string, std::vector<std::string>> type_to_names{
       {"traversable", {"traversable"}}, {"obstacle", {"obstacle"}}};
 
@@ -126,7 +128,7 @@ protected:
       type_to_names, /*keep_time*/ 0.0, /*update_rate*/ 0.0, /*max_dist*/ 100.0, /*min_dist*/ 0.0,
       *tf_buffer_, /*global_frame*/ "odom", /*sensor_frame*/ "",
       tf2::durationFromSec(0.0), kRes, /*decay*/ 5.0, /*visualize*/ false,
-      /*use_cost_selection*/ false, /*project_pointcloud*/ true, optical_frame);
+      use_cost_selection, /*project_pointcloud*/ true, optical_frame);
     buf->createSegmentationCostMultimapFromIds({{"traversable", 255}, {"obstacle", 0}});
     return buf;
   }
@@ -195,6 +197,31 @@ TEST_F(ProjectionBufferTest, PointOnObstaclePixelBuffersObstacleClass)
   inspectTileMap(*buf, n_tiles, first_class);
   EXPECT_EQ(n_tiles, 1u);
   EXPECT_EQ(first_class, 0);
+}
+
+// Three points on one tile (40, -11): y=-0.51/-0.52 -> pixels 75/76 (traversable),
+// y=-0.54 -> pixel 77 (obstacle). Cost selection lets the lone obstacle point win,
+// unless obstacle needs more points per tile than it has.
+TEST_F(ProjectionBufferTest, MinPointsPerTileFiltersSparseObstacle)
+{
+  addCoLocatedFrames();
+  auto mask = makeMask({{75, 50}, {76, 50}});
+  auto conf = mask;
+  conf.data.assign(conf.data.size(), 255);
+  auto cloud = makeCloud(
+    "lidar_frame", {{2.02f, -0.51f, 0.0f}, {2.02f, -0.52f, 0.0f}, {2.02f, -0.54f, 0.0f}});
+
+  for (int min_points : {1, 2}) {
+    auto buf = makeBuffer("", /*use_cost_selection*/ true, min_points);
+    buf->setCameraInfo(makeCameraInfo("rgb_camera_frame"));
+    buf->bufferSegmentation(cloud, mask, conf);
+
+    size_t n_tiles;
+    int first_class;
+    inspectTileMap(*buf, n_tiles, first_class);
+    EXPECT_EQ(n_tiles, 1u) << "min_points=" << min_points;
+    EXPECT_EQ(first_class, min_points == 1 ? 0 : 255) << "min_points=" << min_points;
+  }
 }
 
 TEST_F(ProjectionBufferTest, RejectsPointBehindCameraOutsideImageAndNonFinite)

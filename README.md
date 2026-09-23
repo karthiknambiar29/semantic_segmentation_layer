@@ -36,7 +36,7 @@ Originally developed by [@pepisg](https://github.com/pepisg) and [@sunart24](htt
   - **Score thresholds**: bin a continuous 0-255 score into named classes with `value_min` / `value_max`.
   - **Direct cost**: map the pixel value straight to a costmap cost, no classes needed.
 - Optional per-pixel confidence image.
-- Per-class cost heuristics: `base_cost`, `max_cost`, `mark_confidence`, `samples_to_max_cost`, `dominant_priority`.
+- Per-class cost heuristics: `base_cost`, `max_cost`, `mark_confidence`, `samples_to_max_cost`, `dominant_priority`, `min_points_per_tile`.
 - Temporal decay of observations (`tile_map_decay_time`).
 - Exact or approximate time synchronization of inputs.
 - Multiple observation sources (cameras) in one layer.
@@ -251,6 +251,7 @@ Also read from the costmap: `track_unknown_space`, `transform_tolerance`.
 | `mark_confidence` | int | `0` | Average confidence threshold, 0-255 (dynamic) |
 | `samples_to_max_cost` | int | `0` | Observations needed for `max_cost` (dynamic) |
 | `dominant_priority` | bool | `false` | A new observation of this class takes over the tile immediately and clears other classes |
+| `min_points_per_tile` | int | `1` | Points of this class that must land on a tile **in one frame** for the class to be a candidate for that tile. Filters stray points (e.g. a single obstacle point at a mask edge) that would otherwise win under `use_cost_selection` (dynamic) |
 
 Note: with the defaults `samples_to_max_cost: 0` and `mark_confidence: 0`, any tile with non-zero confidence gets `max_cost`. Set both to use `base_cost` as a "seen once" cost.
 
@@ -328,7 +329,7 @@ Tiles are indexed in `global_frame` at the costmap resolution, independently of 
    - RGBD: point `i` belongs to pixel `i`.
    - LiDAR: each point is transformed to `global_frame` (for binning) and to the camera frame (for projection), projected with the intrinsics, and dropped if behind the camera or outside the image.
    - Points that are non-finite or outside `[min, max]_obstacle_distance` from the cloud origin are dropped.
-3. **One observation per tile per frame**: highest `max_cost` (`use_cost_selection: true`) or highest confidence.
+3. **One observation per tile per frame**: points are counted per class on each tile; only classes with at least `min_points_per_tile` points compete. Among those, highest `max_cost` (`use_cost_selection: true`) or highest confidence wins, ties go to the class with more points. A tile with no qualifying class gets no observation that frame.
 4. **Push and dominance**: the observation goes into its class queue. The tile's **dominant class** decides its cost:
    - `dominant_priority: true` classes take over immediately and clear the other queues.
    - Otherwise a class becomes dominant only when its queue is longer than the current dominant queue.

@@ -250,7 +250,7 @@ void SegmentationBuffer::bufferSegmentation(
     sensor_msgs::PointCloud2ConstIterator<float> iter_x_global(global_frame_cloud, "x");
     sensor_msgs::PointCloud2ConstIterator<float> iter_y_global(global_frame_cloud, "y");
     sensor_msgs::PointCloud2ConstIterator<float> iter_z_global(global_frame_cloud, "z");
-    std::unordered_map<TileIndex, int> best_observations_idxs;
+    TileCandidates candidates;
     double cloud_time_seconds = rclcpp::Time(cloud.header.stamp.sec, cloud.header.stamp.nanosec).seconds();
 
     // copy over the points that are within our segmentation range
@@ -280,41 +280,15 @@ void SegmentationBuffer::bufferSegmentation(
         }
 
         TileIndex costmap_index = temporal_tile_map_->worldToIndex(*iter_x_global, *iter_y_global);
-
-        // Selection policy per tile: cost-based (max_cost) or confidence-based
-        auto it = best_observations_idxs.find(costmap_index);
-        if (it != best_observations_idxs.end()) {
-          if (use_cost_selection_) {
-            // Cost-based: pick highest max_cost (of the resolved class).
-            int current_class = resolveClassId(segmentation.data[pixel_idx]);
-            int existing_class = resolveClassId(segmentation.data[it->second]);
-            uint8_t current_max = current_class >= 0
-              ? segmentation_cost_multimap_->getCostById(current_class).max_cost : 0;
-            uint8_t existing_max = existing_class >= 0
-              ? segmentation_cost_multimap_->getCostById(existing_class).max_cost : 0;
-            if (current_max > existing_max) {
-              best_observations_idxs[costmap_index] = pixel_idx;
-              RCLCPP_DEBUG(logger_, "COST-BASED: Replaced tile observation - current_class=%d (max_cost=%d) > existing_class=%d (max_cost=%d)",
-                          current_class, current_max, existing_class, existing_max);
-            }
-          } else {
-            // Confidence-based: pick highest confidence
-            if (confidence.data[pixel_idx] > confidence.data[it->second]) {
-              best_observations_idxs[costmap_index] = pixel_idx;
-              RCLCPP_DEBUG(logger_, "CONFIDENCE-BASED: Replaced tile observation - current_confidence=%d > existing_confidence=%d", 
-                          confidence.data[pixel_idx], confidence.data[it->second]);
-            }
-          }
-        } else {
-          best_observations_idxs[costmap_index] = pixel_idx;
-        }
+        addCandidate(candidates, costmap_index, pixel_idx, segmentation, confidence);
         ++iter_x_global;
         ++iter_y_global;
         ++iter_z_global;
       }
     }
 
-    commitObservations(best_observations_idxs, segmentation, confidence, cloud_time_seconds);
+    commitObservations(selectObservations(candidates, confidence), segmentation, confidence,
+                       cloud_time_seconds);
 
   } catch (tf2::TransformException& ex)
   {
@@ -326,6 +300,61 @@ void SegmentationBuffer::bufferSegmentation(
 
   // if the update was successful, we want to update the last updated time
   last_updated_ = clock_->now();
+}
+
+void SegmentationBuffer::addCandidate(TileCandidates& candidates, const TileIndex& tile,
+                                      int pixel_idx, const sensor_msgs::msg::Image& segmentation,
+                                      const sensor_msgs::msg::Image& confidence) const
+{
+  const int class_id = resolveClassId(segmentation.data[pixel_idx]);
+  if (class_id < 0)
+  {
+    return;
+  }
+  auto& entry = candidates[tile][class_id];  // {count, pixel}, zero-initialized
+  if (entry.first == 0 || confidence.data[pixel_idx] > confidence.data[entry.second])
+  {
+    entry.second = pixel_idx;
+  }
+  ++entry.first;
+}
+
+std::unordered_map<TileIndex, int> SegmentationBuffer::selectObservations(
+  const TileCandidates& candidates, const sensor_msgs::msg::Image& confidence) const
+{
+  std::unordered_map<TileIndex, int> best_observations_idxs;
+  for (const auto& [tile, classes] : candidates)
+  {
+    int best_pixel = -1, best_count = 0;
+    uint8_t best_max_cost = 0;
+    for (const auto& [class_id, entry] : classes)
+    {
+      const auto& [count, pixel_idx] = entry;
+      const CostHeuristicParams params = segmentation_cost_multimap_->getCostById(class_id);
+      if (count < params.min_points_per_tile)
+      {
+        continue;  // too few points of this class on the tile this frame
+      }
+      bool better = best_pixel < 0;
+      if (!better)
+      {
+        const int a = use_cost_selection_ ? params.max_cost : confidence.data[pixel_idx];
+        const int b = use_cost_selection_ ? best_max_cost : confidence.data[best_pixel];
+        better = a > b || (a == b && count > best_count);
+      }
+      if (better)
+      {
+        best_pixel = pixel_idx;
+        best_count = count;
+        best_max_cost = params.max_cost;
+      }
+    }
+    if (best_pixel >= 0)
+    {
+      best_observations_idxs[tile] = best_pixel;
+    }
+  }
+  return best_observations_idxs;
 }
 
 void SegmentationBuffer::commitObservations(
@@ -431,7 +460,7 @@ void SegmentationBuffer::bufferProjectedSegmentation(
     sensor_msgs::PointCloud2ConstIterator<float> cx(camera_cloud, "x"), cy(camera_cloud, "y"),
       cz(camera_cloud, "z");
 
-    std::unordered_map<TileIndex, int> best_observations_idxs;
+    TileCandidates candidates;
     const size_t n_points = static_cast<size_t>(camera_cloud.width) * camera_cloud.height;
 
     for (size_t i = 0; i < n_points; ++i, ++gx, ++gy, ++gz, ++cx, ++cy, ++cz)
@@ -481,34 +510,13 @@ void SegmentationBuffer::bufferProjectedSegmentation(
       const int pixel_idx = v * width + u;
       const TileIndex costmap_index = temporal_tile_map_->worldToIndex(*gx, *gy);
 
-      // One observation per tile per frame. Many LiDAR points can land on the
-      // same pixel / tile; keep one using the same policy as the aligned path.
-      auto it = best_observations_idxs.find(costmap_index);
-      if (it == best_observations_idxs.end())
-      {
-        best_observations_idxs[costmap_index] = pixel_idx;
-        continue;
-      }
-      if (use_cost_selection_)
-      {
-        int current_class = resolveClassId(segmentation.data[pixel_idx]);
-        int existing_class = resolveClassId(segmentation.data[it->second]);
-        uint8_t current_max = current_class >= 0
-          ? segmentation_cost_multimap_->getCostById(current_class).max_cost : 0;
-        uint8_t existing_max = existing_class >= 0
-          ? segmentation_cost_multimap_->getCostById(existing_class).max_cost : 0;
-        if (current_max > existing_max)
-        {
-          it->second = pixel_idx;
-        }
-      }
-      else if (confidence.data[pixel_idx] > confidence.data[it->second])
-      {
-        it->second = pixel_idx;
-      }
+      // Many LiDAR points can land on the same tile; count them per class and
+      // pick one per tile after the loop (same policy as the aligned path).
+      addCandidate(candidates, costmap_index, pixel_idx, segmentation, confidence);
     }
 
-    commitObservations(best_observations_idxs, segmentation, confidence, cloud_time_seconds);
+    commitObservations(selectObservations(candidates, confidence), segmentation, confidence,
+                       cloud_time_seconds);
   }
   catch (const tf2::TransformException& ex)
   {

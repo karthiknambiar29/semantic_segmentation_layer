@@ -201,6 +201,7 @@ void SemanticSegmentationLayer::onInitialize()
       declareParameter(source + "." + class_type + ".mark_confidence", rclcpp::ParameterValue(0));
       declareParameter(source + "." + class_type + ".samples_to_max_cost", rclcpp::ParameterValue(0));
       declareParameter(source + "." + class_type + ".dominant_priority", rclcpp::ParameterValue(false));
+      declareParameter(source + "." + class_type + ".min_points_per_tile", rclcpp::ParameterValue(1));
       
       node->get_parameter(name_ + "." + source + "." + class_type + ".classes", classes_ids);
       if (classes_ids.empty())
@@ -246,6 +247,7 @@ void SemanticSegmentationLayer::onInitialize()
       node->get_parameter(name_ + "." + source + "." + class_type + ".mark_confidence", cost_params.mark_confidence);
       node->get_parameter(name_ + "." + source + "." + class_type + ".samples_to_max_cost", cost_params.samples_to_max_cost);
       node->get_parameter(name_ + "." + source + "." + class_type + ".dominant_priority", cost_params.dominant_priority);
+      node->get_parameter(name_ + "." + source + "." + class_type + ".min_points_per_tile", cost_params.min_points_per_tile);
       
       for (auto& class_id : classes_ids)
       {
@@ -707,6 +709,13 @@ SemanticSegmentationLayer::dynamicParametersCallback(
                 for(auto & class_name : class_names_for_type){
                   CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
                   cost_params.samples_to_max_cost = parameter.as_int();
+                  buffer->updateClassMap(class_name, cost_params);
+                }
+              }
+              if (name == name_ + "." + source +  "." + class_type + "." + "min_points_per_tile") {
+                for(auto & class_name : class_names_for_type){
+                  CostHeuristicParams cost_params = buffer->getCostForClassName(class_name);
+                  cost_params.min_points_per_tile = parameter.as_int();
                   buffer->updateClassMap(class_name, cost_params);
                 }
               }
