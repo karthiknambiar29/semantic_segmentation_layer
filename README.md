@@ -257,6 +257,46 @@ Note: with the defaults `samples_to_max_cost: 0` and `mark_confidence: 0`, any t
 
 Costs follow Nav2 conventions: `0` free, `253` inscribed, `254` lethal.
 
+### Filtering stray points (`min_points_per_tile`)
+
+Each frame, every tile gets at most **one** observation. With `use_cost_selection: true` that is the class with the highest `max_cost` among the points that landed on the tile, so a single obstacle point (a mask-edge pixel, a LiDAR/camera misalignment) beats any number of traversable points on the same tile. Two symptoms follow:
+
+- One misclassified point makes the whole tile lethal.
+- A tile that is really traversable does not flip back, because in almost every frame one stray obstacle point still lands on it, and the traversable class (even with `dominant_priority: true`) is only pushed in a frame where it wins.
+
+`min_points_per_tile` fixes this per class. Points are counted per class on each tile, and a class only competes for the tile if it has at least that many points **in the current frame**. Among the classes that qualify, the normal rule picks the winner (highest `max_cost`, or highest confidence), ties going to the class with more points. If no class qualifies, the tile gets no observation that frame and keeps its history.
+
+```yaml
+class_types: ["obstacle", "traversable"]
+obstacle:
+  classes: ["obstacle"]
+  class_ids: [1]
+  value_min: 0
+  value_max: 125
+  base_cost: 254
+  max_cost: 254
+  min_points_per_tile: 3      # a tile needs >= 3 obstacle points in one frame
+traversable:
+  classes: ["traversable"]
+  class_ids: [2]
+  value_min: 126
+  value_max: 255
+  base_cost: 0
+  max_cost: 0
+  dominant_priority: true     # takes the tile over as soon as it wins a frame
+  # min_points_per_tile: 1 (default)
+```
+
+With this, a tile hit by 1-2 obstacle points and some traversable points is recorded as traversable, and `dominant_priority` clears its obstacle history immediately.
+
+Tuning:
+
+- The default `1` reproduces the old behaviour.
+- Points per tile fall with range (a LiDAR ring spreads out), so a high value can hide real obstacles far away. Start with `2`-`3` at `0.1` m resolution and check tiles near `max_obstacle_distance`.
+- Set it on the high-cost class. Leaving low-cost classes at `1` keeps sparse far ground from disappearing.
+- Different from `samples_to_max_cost`, which counts observations over time (frames within `tile_map_decay_time`) and chooses between `base_cost` and `max_cost`. `min_points_per_tile` decides which class a tile gets in a single frame. They combine: `min_points_per_tile` filters per-frame spikes, `samples_to_max_cost` (with a lower `base_cost`) filters one-frame flickers.
+- Settable at runtime: `ros2 param set /<costmap_node> <layer>.<source>.obstacle.min_points_per_tile 3`.
+
 ## Mask interpretation
 
 The layer resolves each pixel value to a class ID (or cost) in this order.
@@ -407,6 +447,7 @@ Without `-R test_`, `colcon test` also runs `ament_lint_common` linters, which m
 | LiDAR points land in the wrong place in the image | Wrong frame convention; see [Frames and TF](#frames-and-tf) |
 | Everything marked `max_cost` | `samples_to_max_cost` / `mark_confidence` left at 0 |
 | Obstacles linger | Lower `tile_map_decay_time` |
+| One stray obstacle point makes a tile lethal, or a traversable tile never clears | Raise the obstacle class's `min_points_per_tile`, see [Filtering stray points](#filtering-stray-points-min_points_per_tile) |
 
 Enable `visualize_tile_map: true` and view `<source>/tile_map` in RViz to see what the layer is buffering.
 
