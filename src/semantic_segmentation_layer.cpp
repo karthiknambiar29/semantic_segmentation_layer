@@ -453,6 +453,9 @@ void SemanticSegmentationLayer::updateBounds(double robot_x, double robot_y, dou
     return;
   }
 
+  // Tiles written this cycle; compared with marked_tiles_ below to clear decayed ones.
+  std::unordered_set<TileIndex> current_tiles;
+
   // Process each tile map one at a time
   for (auto& tile_map_pair : segmentation_tile_maps)
   {
@@ -489,9 +492,33 @@ void SemanticSegmentationLayer::updateBounds(double robot_x, double robot_y, dou
         costmap_[index] = cost_params.base_cost;
       }
       touch(tile_world_coords.x, tile_world_coords.y, min_x, min_y, max_x, max_y);
+      current_tiles.insert(tile.first);
     }
     buffer->unlock();
   }
+
+  // Clear what decayed: tiles written last cycle whose observations have all expired
+  // (purgeOldObservations erased them) go back to the default value, and their bounds
+  // are touched so the master costmap is reset and recomputed there.
+  if (!segmentation_tile_maps.empty())
+  {
+    const auto& tile_map = segmentation_tile_maps.front().first;
+    for (const auto& tile : marked_tiles_)
+    {
+      if (current_tiles.count(tile))
+      {
+        continue;
+      }
+      TileWorldXY world = tile_map->indexToWorld(tile.x, tile.y);
+      unsigned int mx, my;
+      if (worldToMap(world.x, world.y, mx, my))  // still inside the (rolling) window
+      {
+        costmap_[getIndex(mx, my)] = default_value_;
+        touch(world.x, world.y, min_x, min_y, max_x, max_y);
+      }
+    }
+  }
+  marked_tiles_.swap(current_tiles);
 
   current_ = true;
 }
@@ -626,6 +653,7 @@ void SemanticSegmentationLayer::syncSegmConfPointcloudCb(const std::shared_ptr<c
 void SemanticSegmentationLayer::reset()
 {
   resetMaps();
+  marked_tiles_.clear();
   current_ = false;
   was_reset_ = true;
 }

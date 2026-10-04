@@ -40,6 +40,7 @@
 
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -194,6 +195,10 @@ class SemanticSegmentationLayer : public nav2_costmap_2d::CostmapLayer
     bool rolling_window_;
     bool was_reset_;
     int combination_method_;
+    // Tiles this layer wrote a cost for in the last updateBounds. A tile whose
+    // observations have all decayed is erased from the tile map, so without this the
+    // cost it wrote would never be cleared (moving obstacles left a permanent trail).
+    std::unordered_set<TileIndex> marked_tiles_;
 };
 
 }  // namespace semantic_segmentation_layer
